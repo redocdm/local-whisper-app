@@ -1,0 +1,21 @@
+{
+  "name": "local-whisper-app",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local-only speech-to-text tray app (Electron + faster-whisper) with global push-to-talk.",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "electron .",
+    "python:venv": "py -3.10 -m venv python/.venv",
+    "python:install": ".\\\\python\\\\.venv\\\\Scripts\\\\python.exe -m pip install --no-deps -r python\\\\requirements.txt",
+    "python:run": ".\\\\python\\\\.venv\\\\Scripts\\\\python.exe python\\\\server.py",
+    "start": "npm run dev"
+  },
+  "dependencies": {
+    "uiohook-napi": "^1.5.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^39.2.7"
+  }
+}
