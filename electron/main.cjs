@@ -96,6 +96,12 @@ function setMode(mode) {
   saveSettings();
   updateTrayMenu();
   notify("Local Whisper", `Mode: ${modeLabel(currentMode)}`);
+  
+  // Announce mode change audibly
+  const announcement = mode === "assistant" 
+    ? "Voice assistant mode" 
+    : "Speech to text mode";
+  speakText(announcement);
 }
 
 function toggleMode() {
@@ -125,6 +131,29 @@ function playCue(kind) {
     const ps = spawn("powershell", ["-NoProfile", "-Command", cmd], { windowsHide: true, stdio: "ignore" });
     ps.on("error", () => {});
   } catch {}
+}
+
+function speakText(text) {
+  // Use Windows SAPI via PowerShell (same approach as Python TTS)
+  const script = (
+    "$t=[Console]::In.ReadToEnd();" +
+    "Add-Type -AssemblyName System.Speech;" +
+    "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;" +
+    "$s.Speak($t);"
+  );
+  
+  try {
+    const ps = spawn(
+      "powershell",
+      ["-NoProfile", "-NonInteractive", "-Command", script],
+      { windowsHide: true, stdio: ["pipe", "ignore", "ignore"] }
+    );
+    ps.stdin.write(text, "utf8");
+    ps.stdin.end();
+    ps.on("error", () => {}); // Best-effort only
+  } catch {
+    // Silently fail if TTS unavailable
+  }
 }
 
 function startPythonService() {

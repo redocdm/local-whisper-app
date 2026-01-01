@@ -44,6 +44,9 @@ AGENT = SimpleAgent()
 _tool_schemas, _tool_fns = build_tools()
 AGENT.set_tools(_tool_schemas, _tool_fns)
 
+# Track active WebSocket connections for broadcasting status updates
+_active_connections = set()
+
 # Health check client for LM Studio availability
 _health_check_client = OpenAICompatClient(
     base_url=CONFIG.llm_base_url,
@@ -97,70 +100,98 @@ async def check_llm_health() -> bool:
         return False
 
 
+async def broadcast_llm_status():
+    """Broadcast LLM status to all connected clients."""
+    if not _active_connections:
+        return
+    message = {"type": "llm_status", "available": STATE.llm_available}
+    disconnected = set()
+    for conn in _active_connections:
+        try:
+            await send_json(conn, message)
+        except Exception:
+            disconnected.add(conn)
+    # Clean up disconnected clients
+    _active_connections.difference_update(disconnected)
+
+
 async def handler(ws):
+    # Register this connection
+    _active_connections.add(ws)
+    
     # Send initial status with LLM availability
     await send_json(ws, {"type": "status", "state": "idle"})
     STATE.llm_available = await check_llm_health()
     await send_json(ws, {"type": "llm_status", "available": STATE.llm_available})
     
-    async for raw in ws:
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-
-        if msg.get("type") == "start":
-            dbg("H_PTT3", "python/ws_server.py:handler", "start command received", {"busy": STATE.busy})
-            if STATE.busy:
-                await send_json(ws, {"type": "error", "message": "Already listening/transcribing."})
+    try:
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
                 continue
 
-            mode = msg.get("mode") or "stt"
-            if mode not in ("stt", "assistant"):
-                mode = "stt"
+            if msg.get("type") == "start":
+                dbg("H_PTT3", "python/ws_server.py:handler", "start command received", {"busy": STATE.busy})
+                if STATE.busy:
+                    await send_json(ws, {"type": "error", "message": "Already listening/transcribing."})
+                    continue
+
+                mode = msg.get("mode") or "stt"
+                if mode not in ("stt", "assistant"):
+                    mode = "stt"
+                
+                # If assistant mode requested but LLM unavailable, fall back to STT
+                if mode == "assistant" and not STATE.llm_available:
+                    await send_json(ws, {
+                        "type": "error",
+                        "message": "LM Studio server not reachable. Assistant mode unavailable. Using STT mode."
+                    })
+                    mode = "stt"
+                
+                STATE.mode = mode
+
+                STATE.busy = True
+                STATE.stop_event = threading.Event()
+                STATE.task = asyncio.create_task(_run_session(ws, STATE.stop_event, mode))
             
-            # If assistant mode requested but LLM unavailable, fall back to STT
-            if mode == "assistant" and not STATE.llm_available:
-                await send_json(ws, {
-                    "type": "error",
-                    "message": "LM Studio server not reachable. Assistant mode unavailable. Using STT mode."
-                })
-                mode = "stt"
-            
-            STATE.mode = mode
+            elif msg.get("type") == "check_llm":
+                # Allow Electron to request LLM health check
+                STATE.llm_available = await check_llm_health()
+                await send_json(ws, {"type": "llm_status", "available": STATE.llm_available})
 
-            STATE.busy = True
-            STATE.stop_event = threading.Event()
-            STATE.task = asyncio.create_task(_run_session(ws, STATE.stop_event, mode))
-        
-        elif msg.get("type") == "check_llm":
-            # Allow Electron to request LLM health check
-            STATE.llm_available = await check_llm_health()
-            await send_json(ws, {"type": "llm_status", "available": STATE.llm_available})
+            elif msg.get("type") == "stop":
+                dbg(
+                    "H_PTT_STOP2",
+                    "python/ws_server.py:handler",
+                    "stop command received",
+                    {"busy": STATE.busy, "hasStopEvent": STATE.stop_event is not None},
+                )
+                if STATE.stop_event is not None:
+                    STATE.stop_event.set()
 
-        elif msg.get("type") == "stop":
-            dbg(
-                "H_PTT_STOP2",
-                "python/ws_server.py:handler",
-                "stop command received",
-                {"busy": STATE.busy, "hasStopEvent": STATE.stop_event is not None},
-            )
-            if STATE.stop_event is not None:
-                STATE.stop_event.set()
-
-        elif msg.get("type") == "ping":
-            await send_json(ws, {"type": "pong"})
+            elif msg.get("type") == "ping":
+                await send_json(ws, {"type": "pong"})
+    finally:
+        # Unregister connection when it closes
+        _active_connections.discard(ws)
 
 
 async def periodic_health_check():
-    """Periodically check LLM availability (every 30 seconds)."""
+    """Periodically check LLM availability (every 30 seconds) and broadcast changes."""
     while True:
         await asyncio.sleep(30)
+        previous_status = STATE.llm_available
         STATE.llm_available = await check_llm_health()
-        if STATE.llm_available:
-            log("LM Studio server is available.")
-        else:
-            log("LM Studio server is not reachable. Assistant mode disabled.")
+        
+        # Only log and broadcast if status changed
+        if STATE.llm_available != previous_status:
+            if STATE.llm_available:
+                log("LM Studio server is available.")
+            else:
+                log("LM Studio server is not reachable. Assistant mode disabled.")
+            # Broadcast status change to all connected clients
+            await broadcast_llm_status()
 
 
 async def main() -> None:
