@@ -14,6 +14,9 @@ try {
 
 const WS_URL = process.env.LOCAL_WHISPER_WS_URL || "ws://127.0.0.1:8765";
 const HOTKEY = process.env.LOCAL_WHISPER_HOTKEY || "Control+Alt+W";
+const MODE_TOGGLE_HOTKEY =
+  process.env.LOCAL_WHISPER_MODE_TOGGLE_HOTKEY || "Control+Alt+M";
+const DEFAULT_MODE = (process.env.LOCAL_WHISPER_DEFAULT_MODE || "stt").toLowerCase();
 const TRAY_ICON_PATH =
   process.env.LOCAL_WHISPER_TRAY_ICON ||
   path.resolve(__dirname, "..", "logo.png");
@@ -25,6 +28,84 @@ let pythonProc = null;
 let reconnectTimer = null;
 let holdActive = false;
 let wasActive = false;
+let llmAvailable = false; // Whether LM Studio is reachable
+
+/** @typedef {"stt" | "assistant"} AppMode */
+/** @type {AppMode} */
+let currentMode = DEFAULT_MODE === "assistant" ? "assistant" : "stt";
+
+function debugLog(location, message, data) {
+  // Opt-in only; avoid unexpected outbound requests.
+  const ingestUrl = process.env.LOCAL_WHISPER_DEBUG_INGEST_URL;
+  if (!ingestUrl) return;
+  try {
+    fetch(ingestUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        location,
+        message,
+        data,
+        timestamp: Date.now(),
+        sessionId: "debug-session",
+        runId: process.env.LOCAL_WHISPER_RUN_ID || "run"
+      })
+    }).catch(() => {});
+  } catch {}
+}
+
+function getSettingsPath() {
+  return path.join(app.getPath("userData"), "settings.json");
+}
+
+function loadSettings() {
+  try {
+    const p = getSettingsPath();
+    if (!fs.existsSync(p)) return;
+    const raw = fs.readFileSync(p, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && (parsed.mode === "stt" || parsed.mode === "assistant")) {
+      currentMode = parsed.mode;
+    }
+  } catch {}
+}
+
+function saveSettings() {
+  try {
+    const p = getSettingsPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify({ mode: currentMode }, null, 2), "utf8");
+  } catch {}
+}
+
+function modeLabel(mode) {
+  return mode === "assistant" ? "Voice Command" : "Simple STT";
+}
+
+function setMode(mode) {
+  if (mode !== "stt" && mode !== "assistant") return;
+  if (currentMode === mode) return;
+  
+  // Prevent switching to assistant mode if LLM is unavailable
+  if (mode === "assistant" && !llmAvailable) {
+    notify("Local Whisper", "LM Studio server not reachable. Assistant mode unavailable.");
+    return;
+  }
+  
+  currentMode = mode;
+  saveSettings();
+  updateTrayMenu();
+  notify("Local Whisper", `Mode: ${modeLabel(currentMode)}`);
+}
+
+function toggleMode() {
+  // If trying to toggle to assistant but LLM unavailable, stay in STT
+  if (currentMode === "stt" && !llmAvailable) {
+    notify("Local Whisper", "LM Studio server not reachable. Assistant mode unavailable.");
+    return;
+  }
+  setMode(currentMode === "stt" ? "assistant" : "stt");
+}
 
 function notify(title, body) {
   try {
@@ -40,18 +121,18 @@ function playCue(kind) {
 
   const cmd = kind === "start" ? "[console]::beep(880,60)" : "[console]::beep(660,60)";
   try {
-    // #region agent log H_PTT_SND
-    fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:playCue',message:'play cue',data:{kind},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'ptt-run',hypothesisId:'H_PTT_SND'})}).catch(()=>{});
-    // #endregion
+    debugLog("electron/main.cjs:playCue", "play cue", { kind });
     const ps = spawn("powershell", ["-NoProfile", "-Command", cmd], { windowsHide: true, stdio: "ignore" });
     ps.on("error", () => {});
   } catch {}
 }
 
 function startPythonService() {
-  // #region agent log H2
-  fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:startPythonService',message:'startPythonService called',data:{wsUrl:WS_URL,hasPythonProc:!!pythonProc,pythonProcKilled:pythonProc?!!pythonProc.killed:null},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'run',hypothesisId:'H2'})}).catch(()=>{});
-  // #endregion
+  debugLog("electron/main.cjs:startPythonService", "startPythonService called", {
+    wsUrl: WS_URL,
+    hasPythonProc: !!pythonProc,
+    pythonProcKilled: pythonProc ? !!pythonProc.killed : null
+  });
   if (pythonProc && !pythonProc.killed) return;
 
   const pythonEntry = path.resolve(__dirname, "..", "python", "server.py");
@@ -73,16 +154,20 @@ function startPythonService() {
     windowsHide: true
   });
 
-  // #region agent log H2
-  fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:startPythonService',message:'python spawned',data:{pid:pythonProc.pid,pythonExe,pythonArgs},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'run',hypothesisId:'H2'})}).catch(()=>{});
-  // #endregion
+  debugLog("electron/main.cjs:startPythonService", "python spawned", {
+    pid: pythonProc.pid,
+    pythonExe,
+    pythonArgs
+  });
 
   pythonProc.stdout.on("data", (d) => process.stdout.write(`[py] ${d}`));
   pythonProc.stderr.on("data", (d) => process.stderr.write(`[py] ${d}`));
   pythonProc.on("exit", (code) => {
-    // #region agent log H4
-    fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:pythonExit',message:'python exited',data:{code,hadWsConnected:wsConnected,wsUrl:WS_URL},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'run',hypothesisId:'H4'})}).catch(()=>{});
-    // #endregion
+    debugLog("electron/main.cjs:pythonExit", "python exited", {
+      code,
+      hadWsConnected: wsConnected,
+      wsUrl: WS_URL
+    });
     pythonProc = null;
     wsConnected = false;
     notify("Local Whisper", `STT service stopped (code ${code}).`);
@@ -93,19 +178,18 @@ function startPythonService() {
 function connectWebSocket() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
-  // #region agent log H1
-  fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:connectWebSocket',message:'connectWebSocket attempt',data:{wsUrl:WS_URL,hasPythonProc:!!pythonProc},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'run',hypothesisId:'H1'})}).catch(()=>{});
-  // #endregion
+  debugLog("electron/main.cjs:connectWebSocket", "connectWebSocket attempt", {
+    wsUrl: WS_URL,
+    hasPythonProc: !!pythonProc
+  });
 
   wsConnected = false;
   ws = new WebSocket(WS_URL);
 
   ws.on("open", () => {
-    // #region agent log H1
-    fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:wsOpen',message:'websocket open',data:{wsUrl:WS_URL},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'run',hypothesisId:'H1'})}).catch(()=>{});
-    // #endregion
+    debugLog("electron/main.cjs:wsOpen", "websocket open", { wsUrl: WS_URL });
     wsConnected = true;
-    notify("Local Whisper", "Ready (Ctrl+Alt+W to talk).");
+    notify("Local Whisper", `Ready (${modeLabel(currentMode)}). Hold ${HOTKEY} to talk.`);
   });
 
   ws.on("message", async (data) => {
@@ -125,10 +209,18 @@ function connectWebSocket() {
         wasActive = true;
         notify("Local Whisper", "Transcribing…");
       }
+      if (msg.state === "thinking") {
+        wasActive = true;
+        notify("Local Whisper", "Thinking…");
+      }
+      if (msg.state === "speaking") {
+        wasActive = true;
+        notify("Local Whisper", "Speaking…");
+      }
       if (msg.state === "idle") {
         if (wasActive) playCue("end");
         wasActive = false;
-        notify("Local Whisper", "Ready.");
+        notify("Local Whisper", `Ready (${modeLabel(currentMode)}).`);
       }
       return;
     }
@@ -142,6 +234,25 @@ function connectWebSocket() {
       return;
     }
 
+    if (msg.type === "assistant_result" && typeof msg.text === "string") {
+      const text = msg.text.trim();
+      if (!text) return;
+      // Voice mode: Python speaks. Optionally show a short preview.
+      const preview = text.length > 140 ? `${text.slice(0, 140)}…` : text;
+      notify("Assistant", preview);
+      return;
+    }
+
+    if (msg.type === "llm_status" && typeof msg.available === "boolean") {
+      llmAvailable = msg.available;
+      // If we're in assistant mode but LLM becomes unavailable, switch to STT
+      if (currentMode === "assistant" && !llmAvailable) {
+        setMode("stt");
+        notify("Local Whisper", "LM Studio unavailable. Switched to STT mode.");
+      }
+      updateTrayMenu();
+    }
+
     if (msg.type === "error" && typeof msg.message === "string") {
       notify("Local Whisper (error)", msg.message);
     }
@@ -153,9 +264,11 @@ function connectWebSocket() {
   });
 
   ws.on("error", (err) => {
-    // #region agent log H3
-    fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:wsError',message:'websocket error',data:{wsUrl:WS_URL,errorMessage:err?err.message:null,errorCode:err?err.code:null},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'run',hypothesisId:'H3'})}).catch(()=>{});
-    // #endregion
+    debugLog("electron/main.cjs:wsError", "websocket error", {
+      wsUrl: WS_URL,
+      errorMessage: err ? err.message : null,
+      errorCode: err ? err.code : null
+    });
     wsConnected = false;
     scheduleReconnect();
   });
@@ -163,9 +276,10 @@ function connectWebSocket() {
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
-  // #region agent log H2
-  fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:scheduleReconnect',message:'scheduleReconnect set',data:{wsUrl:WS_URL,hasPythonProc:!!pythonProc},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'run',hypothesisId:'H2'})}).catch(()=>{});
-  // #endregion
+  debugLog("electron/main.cjs:scheduleReconnect", "scheduleReconnect set", {
+    wsUrl: WS_URL,
+    hasPythonProc: !!pythonProc
+  });
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     startPythonService();
@@ -174,9 +288,12 @@ function scheduleReconnect() {
 }
 
 function sendStartCommand() {
-  // #region agent log H_PTT1
-  fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:sendStartCommand',message:'hotkey triggered -> send start',data:{wsConnected,wsReadyState:ws?ws.readyState:null,hotkey:HOTKEY},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'ptt-run',hypothesisId:'H_PTT1'})}).catch(()=>{});
-  // #endregion
+  debugLog("electron/main.cjs:sendStartCommand", "hotkey triggered -> send start", {
+    wsConnected,
+    wsReadyState: ws ? ws.readyState : null,
+    hotkey: HOTKEY,
+    mode: currentMode
+  });
   if (holdActive) return;
   holdActive = true;
   if (!wsConnected || !ws || ws.readyState !== WebSocket.OPEN) {
@@ -185,15 +302,18 @@ function sendStartCommand() {
     return;
   }
   playCue("start");
-  ws.send(JSON.stringify({ type: "start" }));
+  ws.send(JSON.stringify({ type: "start", mode: currentMode }));
 }
 
 function sendStopCommand() {
   if (!holdActive) return;
   holdActive = false;
-  // #region agent log H_PTT_STOP1
-  fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:sendStopCommand',message:'hotkey released -> send stop',data:{wsConnected,wsReadyState:ws?ws.readyState:null,hotkey:HOTKEY},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'ptt-run',hypothesisId:'H_PTT_STOP1'})}).catch(()=>{});
-  // #endregion
+  debugLog("electron/main.cjs:sendStopCommand", "hotkey released -> send stop", {
+    wsConnected,
+    wsReadyState: ws ? ws.readyState : null,
+    hotkey: HOTKEY,
+    mode: currentMode
+  });
   if (!wsConnected || !ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type: "stop" }));
 }
@@ -233,9 +353,7 @@ function setupHoldToTalk() {
   const spec = parseHoldHotkey(HOTKEY);
   if (!spec) return false;
 
-  // #region agent log H_PTT_HOOK
-  fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:setupHoldToTalk',message:'uIOhook enabled',data:{hotkey:HOTKEY,parsed:spec},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'ptt-run',hypothesisId:'H_PTT_HOOK'})}).catch(()=>{});
-  // #endregion
+  debugLog("electron/main.cjs:setupHoldToTalk", "uIOhook enabled", { hotkey: HOTKEY, parsed: spec });
 
   const matches = (event) => {
     if (event.keycode !== spec.keycode) return false;
@@ -291,16 +409,47 @@ function setupTrayIfPossible() {
   if (!fs.existsSync(TRAY_ICON_PATH)) return;
 
   tray = new Tray(TRAY_ICON_PATH);
-  tray.setToolTip("Local Whisper (Hold-to-talk)");
+  tray.setToolTip("Local Whisper");
+  updateTrayMenu();
+}
+
+function updateTrayMenu() {
+  if (!tray) return;
 
   const menu = Menu.buildFromTemplate([
-    { label: "Push-to-talk (Ctrl+Alt+W)", enabled: false },
+    { label: `Hold-to-talk: ${HOTKEY}`, enabled: false },
+    { label: `Toggle mode: ${MODE_TOGGLE_HOTKEY}`, enabled: false },
+    { type: "separator" },
+    { label: "Mode", enabled: false },
+    {
+      label: "Simple STT (paste transcript)",
+      type: "radio",
+      checked: currentMode === "stt",
+      click: () => setMode("stt")
+    },
+    {
+      label: llmAvailable 
+        ? "Voice Command (assistant speaks)" 
+        : "Voice Command (LM Studio unavailable)",
+      type: "radio",
+      checked: currentMode === "assistant",
+      enabled: llmAvailable,
+      click: () => setMode("assistant")
+    },
+    { type: "separator" },
+    {
+      label: llmAvailable 
+        ? "✓ LM Studio: Available" 
+        : "✗ LM Studio: Not reachable",
+      enabled: false
+    },
     { type: "separator" },
     {
       label: "Quit",
       click: () => app.quit()
     }
   ]);
+
   tray.setContextMenu(menu);
 }
 
@@ -312,9 +461,8 @@ app.on("window-all-closed", (e) => {
 app.whenReady().then(() => {
   app.setAppUserModelId("local-whisper-app");
 
-  // #region agent log H1
-  fetch('http://127.0.0.1:7242/ingest/a093ff22-0c3c-4383-aa9a-fca72615f301',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'electron/main.cjs:whenReady',message:'app ready',data:{wsUrl:WS_URL,hotkey:HOTKEY},timestamp:Date.now(),sessionId:'debug-session',runId:process.env.LOCAL_WHISPER_RUN_ID||'run',hypothesisId:'H1'})}).catch(()=>{});
-  // #endregion
+  loadSettings();
+  debugLog("electron/main.cjs:whenReady", "app ready", { wsUrl: WS_URL, hotkey: HOTKEY, mode: currentMode });
 
   setupTrayIfPossible();
 
@@ -322,9 +470,12 @@ app.whenReady().then(() => {
   // (scheduleReconnect will spawn Python on connection failure)
   connectWebSocket();
 
+  const toggleOk = globalShortcut.register(MODE_TOGGLE_HOTKEY, () => toggleMode());
+  if (!toggleOk) notify("Local Whisper", `Failed to register mode toggle: ${MODE_TOGGLE_HOTKEY}`);
+
   const holdOk = setupHoldToTalk();
   if (holdOk) {
-    notify("Local Whisper", `Hold-to-talk enabled: ${HOTKEY}`);
+    notify("Local Whisper", `Hold-to-talk enabled: ${HOTKEY}. Mode: ${modeLabel(currentMode)}.`);
     return;
   }
 
