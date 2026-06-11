@@ -1,74 +1,57 @@
 # macOS Porting Notes
 
-This document tracks the changes required to run Local Whisper App on macOS.
-No code changes have been made yet — this is a reference for when Mac support is implemented.
+This document tracks the changes required to run Local Whisper App on macOS as a
+single cross-platform repo (one branch, runtime platform detection, no fork).
+No code changes have been made yet — this is the implementation reference.
 
 ## Prerequisites (macOS)
 
-- **macOS 12 Ventura or later** recommended
+- **macOS 13+** recommended
 - **Node.js** LTS
 - **Python 3.10**
-- Apple Silicon (M1/M2/M3) or Intel. Apple Silicon can use MPS acceleration.
-- **Accessibility permission** must be granted to the app in:
-  System Settings → Privacy & Security → Accessibility
+- **Xcode Command Line Tools** (`xcode-select --install`) — needed to build `webrtcvad`,
+  which has no prebuilt macOS arm64 wheels
+- **Accessibility permission** granted to the app (Terminal/Electron) in
+  System Settings → Privacy & Security → Accessibility — required by BOTH the
+  global hotkey hook (`uiohook-napi`) and synthetic Cmd+V paste
 
 ---
 
-## Required code changes
+## Architecture: how one repo supports both platforms
 
-### 1. Paste — `electron/main.cjs`
+**Electron:** all four PowerShell call sites in `main.cjs` (persistent helper,
+beep fallback, `speakText`, paste fallback) move behind a single
+`electron/platform.cjs` module that exports one object per platform:
 
-Replace the PowerShell `SendKeys` helper with an `osascript` call.
-
-**Current (Windows):**
-```powershell
-[System.Windows.Forms.SendKeys]::SendWait('^v')
+```js
+// electron/platform.cjs
+module.exports = process.platform === "darwin"
+  ? {
+      helperCmd: "bash",
+      helperArgs: ["-c", MAC_HELPER_SCRIPT],
+      speak: (text) => spawnSay(text),          // `say`
+      pasteFallback: () => spawnOsascriptPaste(),
+      venvPython: "python/.venv/bin/python",
+      fallbackPython: "python3.10",
+      defaultDevice: "cpu",
+    }
+  : {
+      helperCmd: "powershell",
+      helperArgs: ["-NoProfile", "-NonInteractive", "-Command", WIN_HELPER_SCRIPT],
+      speak: (text) => spawnSapiSpeak(text),     // SAPI
+      pasteFallback: () => spawnSendKeysPaste(),
+      venvPython: "python/.venv/Scripts/python.exe",
+      fallbackPython: "py",
+      defaultDevice: "cuda",
+    };
 ```
 
-**macOS replacement:**
-```bash
-osascript -e 'tell application "System Events" to keystroke "v" using command down'
-```
+`main.cjs` imports this once; no `if (isMac)` scattered through the logic.
 
-The long-lived helper process concept stays the same — just swap the script body and use `bash` instead of `powershell` as the process.
+**Python:** one dispatch point per platform-specific module, selected on `sys.platform`:
 
----
-
-### 2. Sound cues — `electron/main.cjs`
-
-Replace `SoundPlayer` / `Speech On.wav` (Windows-only) with `afplay`.
-
-**macOS replacement in helper script:**
-```bash
-case "$line" in
-  beep:start) afplay /System/Library/Sounds/Tink.aiff ;;
-  beep:end)   afplay /System/Library/Sounds/Pop.aiff ;;
-esac
-```
-
-Alternatively use Electron's `shell.beep()` as a cross-platform baseline (no WAV needed).
-
----
-
-### 3. TTS — `python/tts/sapi_tts.py`
-
-Windows SAPI (`System.Speech`) is not available on macOS. Replace with the built-in `say` command.
-
-**macOS replacement (`python/tts/sapi_tts.py` or a new `macos_tts.py`):**
 ```python
-import subprocess, os
-
-def speak(text: str) -> None:
-    if os.getenv("ASSISTANT_TTS_ENABLED", "1") == "0":
-        return
-    text = (text or "").strip()
-    if not text:
-        return
-    subprocess.run(["say", text], check=False)
-```
-
-The TTS module should detect platform and dispatch accordingly:
-```python
+# python/tts/__init__.py
 import sys
 if sys.platform == "darwin":
     from tts.macos_tts import speak
@@ -76,44 +59,94 @@ else:
     from tts.sapi_tts import speak
 ```
 
+Callers do `from tts import speak` and never see the platform.
+
 ---
 
-### 4. Whisper device — `electron/main.cjs` / `python/stt/settings.py`
+## Required changes, by file
 
-CUDA is not available on macOS. Default `WHISPER_DEVICE` should be `auto` on macOS
-(faster-whisper supports MPS on Apple Silicon with recent versions) or `cpu` as a safe fallback.
+### 1. `electron/main.cjs` — four PowerShell call sites
+
+| Site | Windows (current) | macOS replacement |
+|------|-------------------|-------------------|
+| Persistent helper (paste + cues) | PowerShell + SendKeys + SoundPlayer | `bash` loop reading stdin; `osascript` for paste, `afplay` for cues |
+| `playCue` fallback | one-shot `[console]::beep` | `afplay /System/Library/Sounds/Tink.aiff` (start) / `Pop.aiff` (end) |
+| `speakText` (mode announcements) | PowerShell SAPI | `say "text"` |
+| `pasteIntoFocusedApp` fallback | PowerShell SendKeys | `osascript -e 'tell application "System Events" to keystroke "v" using command down'` |
+
+macOS helper script body:
+
+```bash
+while IFS= read -r line; do
+  case "$line" in
+    paste)      osascript -e 'tell application "System Events" to keystroke "v" using command down' ;;
+    beep:start) afplay /System/Library/Sounds/Tink.aiff & ;;
+    beep:end)   afplay /System/Library/Sounds/Pop.aiff & ;;
+  esac
+done
+```
+
+Also in `main.cjs`: the spawned-Python resolution is Windows-only —
+`python/.venv/Scripts/python.exe` and the `"py"` launcher fallback must come from
+`platform.cjs` (`python/.venv/bin/python` and `python3.10` on macOS), as must the
+`WHISPER_DEVICE` default passed to the Python process env.
+
+### 2. `python/tts/macos_tts.py` — new file
+
+```python
+import os
+import subprocess
+
+
+def speak(text: str) -> None:
+    if (os.getenv("ASSISTANT_TTS_ENABLED", "1") or "1") == "0":
+        return
+    text = (text or "").strip()
+    if not text:
+        return
+    subprocess.run(["say", text], check=False, timeout=120)
+```
+
+Plus the dispatch in `python/tts/__init__.py` (see above), and `ws_server.py`
+switches its import to `from tts import speak`.
+
+### 3. Whisper device default — `python/stt/settings.py`
+
+**Important correction:** faster-whisper is built on CTranslate2, which supports
+**CPU and CUDA only — there is no Metal/MPS backend.** On Apple Silicon it runs
+on CPU via Apple Accelerate (decent for `small.en`, but not GPU-fast).
 
 ```python
 import sys
-default_device = "auto" if sys.platform == "darwin" else "cuda"
+device: str = os.getenv("WHISPER_DEVICE", "cpu" if sys.platform == "darwin" else "cuda")
 ```
 
-Compute type: use `float32` or `int8` on CPU/MPS.
+Practical guidance for Mac users:
+- **Moonshine is the better default on macOS** — it is CPU-native, streams during
+  recording, and its post-release latency is near zero.
+- For Whisper-quality output on Apple Silicon GPU, a future option is swapping the
+  backend to `mlx-whisper` or `whisper.cpp` — out of scope for the initial port.
 
----
+### 4. `python/stt/cudnn.py`
 
-### 5. cuDNN DLL setup — `python/stt/cudnn.py`
+Already guarded with `if sys.platform != "win32": return`. **No change needed.** ✅
 
-Already a no-op on non-Windows (the function checks the platform before adding DLL paths).
-**No change needed.**
+### 5. `package.json` scripts — currently Windows-only
 
----
+`py -3.10` and `python\.venv\Scripts\python.exe` fail on macOS. Most elegant fix:
+replace the three scripts with one small Node launcher (Node is already a
+prerequisite) that resolves the right interpreter/paths per platform:
 
-### 6. Hotkey / uiohook-napi
+```json
+"python:venv":    "node scripts/py.cjs venv",
+"python:install": "node scripts/py.cjs install",
+"python:run":     "node scripts/py.cjs run"
+```
 
-`uiohook-napi` works on macOS but the app must be granted **Accessibility permission**.
-Without it, `keydown`/`keyup` events are not delivered and hold-to-talk silently fails.
+`scripts/py.cjs` picks `py -3.10` / `python3.10` and `Scripts/` / `bin/` based on
+`process.platform` (~20 lines, reusing the same constants as `electron/platform.cjs`).
 
-The app should detect failure and show a notification:
-> "Hold-to-talk requires Accessibility access. Go to System Settings → Privacy & Security → Accessibility and enable Local Whisper."
-
-No code change to `uiohook-napi` itself — just a better error message on macOS.
-
----
-
-### 7. `start-local-whisper.bat`
-
-Not applicable on macOS. Provide a `start-local-whisper.command` (double-clickable shell script) or a `start-local-whisper.sh`:
+### 6. Launcher — `start-local-whisper.command` (new file)
 
 ```bash
 #!/bin/bash
@@ -121,19 +154,46 @@ cd "$(dirname "$0")"
 npm run dev
 ```
 
-Mark executable: `chmod +x start-local-whisper.command`
+`chmod +x start-local-whisper.command` (double-clickable in Finder).
+`start-local-whisper.bat` stays for Windows.
+
+### 7. Hotkeys — `uiohook-napi`
+
+Has macOS prebuilds (incl. arm64); works once Accessibility permission is granted.
+Without permission, keydown/keyup silently never fire — the app should detect this
+on macOS and show a notification pointing at
+System Settings → Privacy & Security → Accessibility.
 
 ---
 
-## Summary of files to change
+## Dependency portability check
+
+| Package | macOS status |
+|---------|--------------|
+| `faster-whisper` / `ctranslate2` | ✅ wheels for macOS arm64/x86_64 (CPU only) |
+| `moonshine-voice` | ✅ supports macOS |
+| `sounddevice` | ✅ bundles PortAudio |
+| `webrtcvad` | ⚠️ builds from source — needs Xcode CLT |
+| `websockets`, `numpy`, etc. | ✅ |
+| `uiohook-napi` | ✅ prebuilds; needs Accessibility permission |
+| Electron (tray, overlay, clipboard, Notification) | ✅ cross-platform |
+
+Everything else (WebSocket server, recording/pre-roll, streaming transcription,
+LLM agent, sandbox FS, overlay HTML) is already platform-agnostic.
+
+## Summary of files to touch
 
 | File | Change |
 |------|--------|
-| `electron/main.cjs` | Platform-switch paste helper and sound cues; default device |
-| `python/tts/sapi_tts.py` | Platform dispatch to `say` on macOS |
-| `python/stt/settings.py` | Default `WHISPER_DEVICE` to `auto` on macOS |
-| `start-local-whisper.command` | New file — macOS launcher |
+| `electron/platform.cjs` | **New** — all platform constants/commands in one place |
+| `electron/main.cjs` | Route 4 PowerShell sites + python/device resolution through `platform.cjs` |
+| `python/tts/macos_tts.py` | **New** — `say`-based TTS |
+| `python/tts/__init__.py` | Platform dispatch |
+| `python/ws_server.py` | Import `from tts import speak` |
+| `python/stt/settings.py` | Platform-aware `WHISPER_DEVICE` default |
+| `scripts/py.cjs` | **New** — cross-platform npm script launcher |
+| `package.json` | Point python:* scripts at `scripts/py.cjs` |
+| `start-local-whisper.command` | **New** — macOS launcher |
 
-All other files (WebSocket server, recording, Moonshine, LLM agent, overlay HTML, sandbox FS) are already platform-agnostic.
-
-Estimated effort: **~1 day** of focused work.
+Estimated effort: **~1 day**, plus testing on real Mac hardware (especially
+Accessibility permission flows and paste into various apps).
