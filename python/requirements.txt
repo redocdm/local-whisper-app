@@ -11,4 +11,5 @@ numpy==2.2.6
 pyyaml==6.0.3
 cffi==2.0.0
 pycparser==2.23
+moonshine-voice==0.0.62
 
