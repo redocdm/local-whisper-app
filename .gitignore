@@ -4,6 +4,8 @@ dist/
 
 python/.venv/
 python/__pycache__/
+**/__pycache__/
+*.pyc
 python/*.wav
 python/vendor/
 
