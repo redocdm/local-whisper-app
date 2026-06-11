@@ -6,6 +6,7 @@ python/.venv/
 python/__pycache__/
 **/__pycache__/
 *.pyc
+python/debug.log
 python/*.wav
 python/vendor/
 

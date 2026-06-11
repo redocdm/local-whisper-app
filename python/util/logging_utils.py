@@ -8,7 +8,9 @@ def log(message: str) -> None:
     print(f"[{ts}] {message}", flush=True)
 
 
-_DBG_LOG_PATH = os.getenv("LOCAL_WHISPER_DEBUG_LOG_PATH") or r"f:\Projects\AppDev\.cursor\debug.log"
+_DBG_LOG_PATH = os.getenv("LOCAL_WHISPER_DEBUG_LOG_PATH") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "debug.log"
+)
 
 
 def dbg(hypothesis_id: str, location: str, message: str, data: dict) -> None:
