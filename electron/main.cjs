@@ -1,4 +1,4 @@
-const { app, globalShortcut, Notification, clipboard, Menu, Tray } = require("electron");
+const { app, globalShortcut, Notification, clipboard, Menu, Tray, BrowserWindow, screen } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -26,13 +26,25 @@ let ws = null;
 let wsConnected = false;
 let pythonProc = null;
 let reconnectTimer = null;
+let reconnectDelayMs = 250;
 let holdActive = false;
 let wasActive = false;
 let llmAvailable = false; // Whether LM Studio is reachable
+let helperProc = null; // Long-lived PowerShell worker for paste/beep (avoids per-call spawn cost)
+let overlayWin = null; // Pre-created waveform overlay window
+let soundCuesEnabled = true;
+let overlayEnabled = true;
+
+const OVERLAY_WIDTH = 320;
+const OVERLAY_HEIGHT = 76;
 
 /** @typedef {"stt" | "assistant"} AppMode */
 /** @type {AppMode} */
 let currentMode = DEFAULT_MODE === "assistant" ? "assistant" : "stt";
+
+/** @typedef {"whisper" | "moonshine"} SttEngine */
+/** @type {SttEngine} */
+let currentSttEngine = "whisper";
 
 function debugLog(location, message, data) {
   // Opt-in only; avoid unexpected outbound requests.
@@ -67,6 +79,15 @@ function loadSettings() {
     if (parsed && (parsed.mode === "stt" || parsed.mode === "assistant")) {
       currentMode = parsed.mode;
     }
+    if (parsed && (parsed.stt_engine === "whisper" || parsed.stt_engine === "moonshine")) {
+      currentSttEngine = parsed.stt_engine;
+    }
+    if (parsed && typeof parsed.sound_cues === "boolean") {
+      soundCuesEnabled = parsed.sound_cues;
+    }
+    if (parsed && typeof parsed.overlay_enabled === "boolean") {
+      overlayEnabled = parsed.overlay_enabled;
+    }
   } catch {}
 }
 
@@ -74,12 +95,38 @@ function saveSettings() {
   try {
     const p = getSettingsPath();
     fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(p, JSON.stringify({ mode: currentMode }, null, 2), "utf8");
+    fs.writeFileSync(
+      p,
+      JSON.stringify(
+        {
+          mode: currentMode,
+          stt_engine: currentSttEngine,
+          sound_cues: soundCuesEnabled,
+          overlay_enabled: overlayEnabled
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
   } catch {}
 }
 
 function modeLabel(mode) {
   return mode === "assistant" ? "Voice Command" : "Simple STT";
+}
+
+function engineLabel(engine) {
+  return engine === "moonshine" ? "Moonshine" : "Whisper";
+}
+
+function setSttEngine(engine) {
+  if (engine !== "whisper" && engine !== "moonshine") return;
+  if (currentSttEngine === engine) return;
+  currentSttEngine = engine;
+  saveSettings();
+  updateTrayMenu();
+  notify("Local Whisper", `STT Engine: ${engineLabel(currentSttEngine)}`);
 }
 
 function setMode(mode) {
@@ -121,13 +168,74 @@ function notify(title, body) {
   }
 }
 
+// One hidden PowerShell process handles all paste/beep commands. Loading
+// System.Windows.Forms once here is what removes the ~0.5-1.5s per-paste cost.
+// Cues use Windows' built-in Speech On/Off WAVs through the normal audio path;
+// [console]::beep routes through the legacy Beep API, which is often inaudible.
+const HELPER_SCRIPT = [
+  "$ErrorActionPreference='SilentlyContinue';",
+  "Add-Type -AssemblyName System.Windows.Forms;",
+  "$startSound = $null; $endSound = $null;",
+  "if (Test-Path 'C:\\Windows\\Media\\Speech On.wav') {",
+  "  $startSound = New-Object System.Media.SoundPlayer 'C:\\Windows\\Media\\Speech On.wav'; $startSound.Load();",
+  "}",
+  "if (Test-Path 'C:\\Windows\\Media\\Speech Off.wav') {",
+  "  $endSound = New-Object System.Media.SoundPlayer 'C:\\Windows\\Media\\Speech Off.wav'; $endSound.Load();",
+  "}",
+  "while ($true) {",
+  "  $line = [Console]::In.ReadLine();",
+  "  if ($null -eq $line) { break }",
+  "  switch ($line) {",
+  "    'paste' { [System.Windows.Forms.SendKeys]::SendWait('^v') }",
+  "    'beep:start' { if ($startSound) { $startSound.Play() } else { [console]::beep(880,60) } }",
+  "    'beep:end' { if ($endSound) { $endSound.Play() } else { [console]::beep(660,60) } }",
+  "  }",
+  "}"
+].join(" ");
+
+function ensureHelper() {
+  if (helperProc && !helperProc.killed && helperProc.exitCode === null) return helperProc;
+  try {
+    helperProc = spawn(
+      "powershell",
+      ["-NoProfile", "-NonInteractive", "-Command", HELPER_SCRIPT],
+      { windowsHide: true, stdio: ["pipe", "ignore", "ignore"] }
+    );
+    helperProc.on("error", () => {
+      helperProc = null;
+    });
+    helperProc.on("exit", () => {
+      helperProc = null;
+    });
+    return helperProc;
+  } catch {
+    helperProc = null;
+    return null;
+  }
+}
+
+function sendHelperCommand(command) {
+  const proc = ensureHelper();
+  if (!proc || !proc.stdin || !proc.stdin.writable) return false;
+  try {
+    proc.stdin.write(`${command}\n`, "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function playCue(kind) {
+  if (!soundCuesEnabled) return;
   const enabled = (process.env.LOCAL_WHISPER_SOUND || "1") !== "0";
   if (!enabled) return;
 
+  debugLog("electron/main.cjs:playCue", "play cue", { kind });
+  if (sendHelperCommand(kind === "start" ? "beep:start" : "beep:end")) return;
+
+  // Fallback: one-shot spawn if the helper is unavailable.
   const cmd = kind === "start" ? "[console]::beep(880,60)" : "[console]::beep(660,60)";
   try {
-    debugLog("electron/main.cjs:playCue", "play cue", { kind });
     const ps = spawn("powershell", ["-NoProfile", "-Command", cmd], { windowsHide: true, stdio: "ignore" });
     ps.on("error", () => {});
   } catch {}
@@ -198,7 +306,9 @@ function startPythonService() {
       wsUrl: WS_URL
     });
     pythonProc = null;
-    wsConnected = false;
+    // If the websocket is still connected, another server instance owns the
+    // port (our spawn lost the bind race) — keep using it, don't respawn.
+    if (wsConnected) return;
     notify("Local Whisper", `STT service stopped (code ${code}).`);
     scheduleReconnect();
   });
@@ -218,6 +328,7 @@ function connectWebSocket() {
   ws.on("open", () => {
     debugLog("electron/main.cjs:wsOpen", "websocket open", { wsUrl: WS_URL });
     wsConnected = true;
+    reconnectDelayMs = 250;
     notify("Local Whisper", `Ready (${modeLabel(currentMode)}). Hold ${HOTKEY} to talk.`);
   });
 
@@ -232,25 +343,35 @@ function connectWebSocket() {
     if (msg.type === "status") {
       if (msg.state === "listening") {
         wasActive = true;
+        showOverlay("listening");
         notify("Local Whisper", "Listening…");
       }
       if (msg.state === "transcribing") {
         wasActive = true;
+        showOverlay("transcribing");
         notify("Local Whisper", "Transcribing…");
       }
       if (msg.state === "thinking") {
         wasActive = true;
+        showOverlay("thinking");
         notify("Local Whisper", "Thinking…");
       }
       if (msg.state === "speaking") {
         wasActive = true;
+        showOverlay("speaking");
         notify("Local Whisper", "Speaking…");
       }
       if (msg.state === "idle") {
         if (wasActive) playCue("end");
         wasActive = false;
+        hideOverlay();
         notify("Local Whisper", `Ready (${modeLabel(currentMode)}).`);
       }
+      return;
+    }
+
+    if (msg.type === "level" && typeof msg.value === "number") {
+      overlaySend("level", msg.value);
       return;
     }
 
@@ -307,13 +428,17 @@ function scheduleReconnect() {
   if (reconnectTimer) return;
   debugLog("electron/main.cjs:scheduleReconnect", "scheduleReconnect set", {
     wsUrl: WS_URL,
-    hasPythonProc: !!pythonProc
+    hasPythonProc: !!pythonProc,
+    delayMs: reconnectDelayMs
   });
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
+    if (wsConnected) return;
     startPythonService();
     connectWebSocket();
-  }, 1200);
+  }, reconnectDelayMs);
+  // Back off while the Python service boots (reset to 250ms on successful connect).
+  reconnectDelayMs = Math.min(Math.round(reconnectDelayMs * 1.6), 3000);
 }
 
 function sendStartCommand() {
@@ -331,7 +456,7 @@ function sendStartCommand() {
     return;
   }
   playCue("start");
-  ws.send(JSON.stringify({ type: "start", mode: currentMode }));
+  ws.send(JSON.stringify({ type: "start", mode: currentMode, stt_engine: currentSttEngine }));
 }
 
 function sendStopCommand() {
@@ -413,12 +538,14 @@ function setupHoldToTalk() {
 
 async function pasteIntoFocusedApp(text) {
   // Most reliable cross-app approach: clipboard + Ctrl+V (SendKeys).
+  // Note: some elevated apps may block this; in that case, run this app elevated too.
   clipboard.writeText(text);
 
   await new Promise((r) => setTimeout(r, 50));
 
-  // SendKeys often works well for "paste into focused app" without native Node modules.
-  // Note: some elevated apps may block this; in that case, run this app elevated too.
+  if (sendHelperCommand("paste")) return;
+
+  // Fallback: one-shot spawn if the helper is unavailable.
   await new Promise((resolve) => {
     const ps = spawn(
       "powershell",
@@ -432,6 +559,60 @@ async function pasteIntoFocusedApp(text) {
     ps.on("exit", () => resolve());
     ps.on("error", () => resolve());
   });
+}
+
+function createOverlayWindow() {
+  // Pre-created and shown/hidden (never recreated) so it appears instantly.
+  // focusable:false + showInactive() keep focus on the app being dictated into.
+  overlayWin = new BrowserWindow({
+    width: OVERLAY_WIDTH,
+    height: OVERLAY_HEIGHT,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    focusable: false,
+    show: false,
+    hasShadow: false,
+    webPreferences: { nodeIntegration: true, contextIsolation: false }
+  });
+  overlayWin.setIgnoreMouseEvents(true);
+  overlayWin.setAlwaysOnTop(true, "screen-saver");
+  overlayWin.loadFile(path.join(__dirname, "overlay.html"));
+  overlayWin.on("closed", () => {
+    overlayWin = null;
+  });
+}
+
+function overlaySend(channel, payload) {
+  if (!overlayWin || overlayWin.isDestroyed()) return;
+  try {
+    overlayWin.webContents.send(channel, payload);
+  } catch {}
+}
+
+function positionOverlay() {
+  const wa = screen.getPrimaryDisplay().workArea;
+  const x = Math.round(wa.x + (wa.width - OVERLAY_WIDTH) / 2);
+  const y = Math.round(wa.y + wa.height - OVERLAY_HEIGHT - 24);
+  overlayWin.setBounds({ x, y, width: OVERLAY_WIDTH, height: OVERLAY_HEIGHT });
+}
+
+function showOverlay(state) {
+  if (!overlayEnabled || !overlayWin || overlayWin.isDestroyed()) return;
+  overlaySend("state", state);
+  if (!overlayWin.isVisible()) {
+    positionOverlay();
+    overlayWin.showInactive();
+  }
+}
+
+function hideOverlay() {
+  if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) {
+    overlayWin.hide();
+  }
 }
 
 function setupTrayIfPossible() {
@@ -466,9 +647,43 @@ function updateTrayMenu() {
       click: () => setMode("assistant")
     },
     { type: "separator" },
+    { label: "STT Engine", enabled: false },
     {
-      label: llmAvailable 
-        ? "✓ LM Studio: Available" 
+      label: "Whisper (faster-whisper)",
+      type: "radio",
+      checked: currentSttEngine === "whisper",
+      click: () => setSttEngine("whisper")
+    },
+    {
+      label: "Moonshine (on-device)",
+      type: "radio",
+      checked: currentSttEngine === "moonshine",
+      click: () => setSttEngine("moonshine")
+    },
+    { type: "separator" },
+    {
+      label: "Sound cues",
+      type: "checkbox",
+      checked: soundCuesEnabled,
+      click: (item) => {
+        soundCuesEnabled = item.checked;
+        saveSettings();
+      }
+    },
+    {
+      label: "Waveform overlay",
+      type: "checkbox",
+      checked: overlayEnabled,
+      click: (item) => {
+        overlayEnabled = item.checked;
+        saveSettings();
+        if (!overlayEnabled) hideOverlay();
+      }
+    },
+    { type: "separator" },
+    {
+      label: llmAvailable
+        ? "✓ LM Studio: Available"
         : "✗ LM Studio: Not reachable",
       enabled: false
     },
@@ -494,9 +709,13 @@ app.whenReady().then(() => {
   debugLog("electron/main.cjs:whenReady", "app ready", { wsUrl: WS_URL, hotkey: HOTKEY, mode: currentMode });
 
   setupTrayIfPossible();
+  createOverlayWindow();
+  ensureHelper();
 
-  // Try connecting first; only spawn Python if no server is listening
-  // (scheduleReconnect will spawn Python on connection failure)
+  // Spawn Python immediately so model warm-up starts as early as possible.
+  // If another server instance already owns the port, our spawn exits and the
+  // websocket connection below attaches to the existing one.
+  startPythonService();
   connectWebSocket();
 
   const toggleOk = globalShortcut.register(MODE_TOGGLE_HOTKEY, () => toggleMode());
@@ -524,6 +743,9 @@ app.on("will-quit", () => {
   } catch {}
   try {
     if (pythonProc && !pythonProc.killed) pythonProc.kill();
+  } catch {}
+  try {
+    if (helperProc && !helperProc.killed) helperProc.kill();
   } catch {}
 });
 

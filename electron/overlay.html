@@ -1,0 +1,118 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    overflow: hidden;
+    user-select: none;
+    -webkit-app-region: no-drag;
+  }
+  #pill {
+    box-sizing: border-box;
+    width: 300px;
+    height: 56px;
+    margin: 10px auto;
+    padding: 8px 18px;
+    background: rgba(24, 24, 27, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 28px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-family: "Segoe UI", system-ui, sans-serif;
+  }
+  #dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #f43f5e;
+    flex: 0 0 auto;
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+  #label {
+    color: rgba(255, 255, 255, 0.75);
+    font-size: 12px;
+    flex: 0 0 auto;
+    min-width: 70px;
+  }
+  #wave {
+    flex: 1 1 auto;
+  }
+</style>
+</head>
+<body>
+  <div id="pill">
+    <div id="dot"></div>
+    <div id="label">Listening</div>
+    <canvas id="wave" width="180" height="40"></canvas>
+  </div>
+<script>
+  const { ipcRenderer } = require("electron");
+
+  const canvas = document.getElementById("wave");
+  const ctx = canvas.getContext("2d");
+  const label = document.getElementById("label");
+  const dot = document.getElementById("dot");
+
+  const BAR_COUNT = 30;
+  const LABELS = {
+    listening: "Listening",
+    transcribing: "Transcribing…",
+    thinking: "Thinking…",
+    speaking: "Speaking…"
+  };
+
+  let levels = new Array(BAR_COUNT).fill(0);
+  let state = "listening";
+  let phase = 0;
+
+  ipcRenderer.on("level", (_e, v) => {
+    if (state !== "listening") return;
+    levels.push(Math.max(0, Math.min(1, Number(v) || 0)));
+    levels.shift();
+  });
+
+  ipcRenderer.on("state", (_e, s) => {
+    state = s;
+    label.textContent = LABELS[s] || s;
+    dot.style.background = s === "listening" ? "#f43f5e" : "#38bdf8";
+    if (s !== "listening") levels.fill(0);
+  });
+
+  function draw() {
+    phase += 0.12;
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const slot = w / BAR_COUNT;
+    const barW = Math.max(2, slot * 0.5);
+
+    for (let i = 0; i < BAR_COUNT; i++) {
+      let lvl = levels[i];
+      if (state !== "listening") {
+        // Gentle traveling ripple while busy (no mic input to show).
+        lvl = 0.10 + 0.14 * Math.pow(Math.sin(phase - i * 0.45), 2);
+      }
+      const bh = Math.max(3, lvl * (h - 4));
+      const x = i * slot + (slot - barW) / 2;
+      const y = (h - bh) / 2;
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.beginPath();
+      ctx.roundRect(x, y, barW, bh, barW / 2);
+      ctx.fill();
+    }
+    requestAnimationFrame(draw);
+  }
+  draw();
+</script>
+</body>
+</html>
